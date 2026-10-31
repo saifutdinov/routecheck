@@ -24,6 +24,7 @@ GP = "https://api.globalping.io/v1/measurements"
 RIPE = "https://stat.ripe.net/data/{}/data.json?{}"
 WIN = sys.platform == "win32"
 TRACE_PROBES = 3  # probes per hop, the default of both traceroute -q and tracert
+LOCAL = "этот компьютер"  # source label of the local trace
 
 Hop = dict  # {"ip", "host", "asn", "loss", "rtt"}
 Path = dict  # {"source", "proto", "hops", "diag", "error"?}
@@ -194,7 +195,7 @@ def local_trace(ip: str, max_hops: int) -> list[Hop]:
 
 
 def local_checks(ip: str, port: int | None, max_hops: int) -> tuple[dict, Path]:
-    path = {"source": "этот компьютер", "proto": "ICMP", "hops": []}
+    path = {"source": LOCAL, "proto": "ICMP", "hops": []}
     with cf.ThreadPoolExecutor() as ex:
         trace = ex.submit(local_trace, ip, max_hops)
         r = {"ping_loss": ping(ip), "mtu_loss": ping(ip, size=1472)}
@@ -478,13 +479,19 @@ def headline(
     ok = [p for p in done if p["diag"]["reached"]]
     if not paths:
         return "info", "Маршрут не проверялся: добавьте -f СТРАНА или уберите --no-local."
-    # no ICMP trace got through, yet the service port answers: ICMP is filtered, the address is fine;
-    # only when no remote TCP trace failed, otherwise the port itself is blocked somewhere
-    if not ok and local and local.get("tcp_ms") and not any(p["proto"].startswith("TCP") for p in done):
-        return "ok", (
-            f"Адрес доступен: порт {port} отвечает ({local['tcp_ms']} мс). Ping и трассировка не доходят, "
-            "потому что ICMP режут на пути или у цели. На работу сервиса это не влияет."
-        )
+    # no trace got through, yet the address answers locally; not when a remote TCP trace failed,
+    # then the port itself is blocked somewhere
+    if not ok and local and not any(p["proto"].startswith("TCP") for p in done):
+        if local["ping_loss"] < 100 and all(p["source"] == LOCAL for p in done):
+            return "ok", (
+                "Адрес доступен: отвечает на ping. Трассировка не дошла до конца: не хватило --max-hops "
+                "или узлы на пути не отвечают на трассировку."
+            )
+        if local["ping_loss"] == 100 and local.get("tcp_ms"):
+            return "ok", (
+                f"Адрес доступен: порт {port} отвечает ({local['tcp_ms']} мс). Ping и трассировка не доходят, "
+                "потому что ICMP режут на пути или у цели. На работу сервиса это не влияет."
+            )
     if not done:
         return "fail", "Ни одна проверка маршрута не выполнилась."
     if len(ok) == len(done):

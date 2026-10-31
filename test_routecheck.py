@@ -262,3 +262,13 @@ def test_headline_icmp_filtered_but_port_answers():
     tcp = path("RU", [hop("7.7.7.7", 7), SILENT]) | {"proto": "TCP 443"}
     assert headline([silent, tcp], 13335, {13335}, {}, local, 443)[0] == "fail"
     assert headline([silent], 13335, {13335}, {}, local | {"tcp_ms": None}, 443)[0] == "fail"
+
+
+def test_headline_ping_works_but_trace_too_short():
+    short = path("этот компьютер", [hop("10.0.0.1", None), hop("2.2.2.2", 2)])
+    local = {"ping_loss": 0.0, "mtu_loss": 0.0, "tcp_ms": 15.8}
+    status, text = headline([short], 13335, {13335}, {}, local, 443)
+    assert status == "ok" and "Трассировка не дошла до конца" in text
+    # remote traces failing while local ping works is a real discrepancy, keep it visible
+    remote = path("RU", [hop("7.7.7.7", 7), SILENT])
+    assert headline([short, remote], 13335, {13335}, {}, local, 443)[0] == "fail"

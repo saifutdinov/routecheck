@@ -1,0 +1,20 @@
+[project]
+name = "routecheck"
+version = "0.1.0"
+readme = "README.md"
+license = "MIT"
+description = "Find where and in which network the route to an IP breaks"
+requires-python = ">=3.10"
+dependencies = []
+
+[dependency-groups]
+dev = ["pytest"]
+
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+
+[tool.uv]
+package = false

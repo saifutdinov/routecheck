@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: "0.13.6"
+      - run: uvx ruff@0.17.3 check .
+      - run: uvx ruff@0.17.3 format --check .
+
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15, windows-2025]
+        python: ["3.10", "3.14"]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: "0.13.6"
+      - name: Unit tests
+        run: uv run --frozen --python ${{ matrix.python }} pytest -q
+      # Runners block ICMP, so the target looks unreachable; the point is that the real
+      # ping/traceroute/tracert run, their output parses and the report prints to a file
+      - name: Smoke run with local checks, output redirected
+        run: |
+          uv run --frozen --python ${{ matrix.python }} routecheck.py 1.1.1.1 -p 443 --max-hops 4 > report.txt 2> err.txt || true
+          cat report.txt err.txt
+          grep -q "ИТОГ" report.txt
+          # port 443 answers even where ICMP is blocked, so the verdict must not be "unreachable"
+          grep -q "Адрес доступен" report.txt
+          grep -q "С этого компьютера" report.txt
+          ! grep -q "Traceback" err.txt

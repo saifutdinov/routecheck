@@ -22,7 +22,9 @@ from collections import Counter
 
 GP = "https://api.globalping.io/v1/measurements"
 RIPE = "https://stat.ripe.net/data/{}/data.json?{}"
-MAC = sys.platform == "darwin"
+WIN = sys.platform == "win32"
+TRACE_PROBES = 3  # probes per hop, the default of both traceroute -q and tracert
+LOCAL = "этот компьютер"  # source label of the local trace
 
 Hop = dict  # {"ip", "host", "asn", "loss", "rtt"}
 Path = dict  # {"source", "proto", "hops", "diag", "error"?}
@@ -43,11 +45,21 @@ def http_json(url: str, body: dict | None = None, timeout: float = 20) -> dict:
         raise RuntimeError(f"{url}: HTTP {e.code} {e.read().decode(errors='replace')[:300]}") from e
 
 
+# Windows console tools print in the OEM code page (cp866 for Russian), not the ANSI one
+ENCODING = "oem" if WIN else None
+
+
 def run(cmd: list[str], timeout: float) -> str:
     try:
-        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout).stdout
+        return subprocess.run(
+            cmd, capture_output=True, text=True, encoding=ENCODING, errors="replace", timeout=timeout
+        ).stdout
     except subprocess.TimeoutExpired as e:
-        return e.stdout.decode() if isinstance(e.stdout, bytes) else (e.stdout or "")
+        out = e.stdout or b""
+        return out.decode(ENCODING or "utf-8", errors="replace") if isinstance(out, bytes) else out
+    except FileNotFoundError as e:
+        hint = " (sudo apt install traceroute или sudo dnf install traceroute)" if cmd[0] == "traceroute" else ""
+        raise RuntimeError(f"не найдена команда {cmd[0]}{hint}") from e
 
 
 def cymru(queries: list[str]) -> list[list[str]]:
@@ -107,13 +119,23 @@ def resolve(target: str) -> str:
 # ---------- local probes ----------
 
 
+def ping_cmd(ip: str, size: int | None, count: int, platform: str = sys.platform) -> list[str]:
+    """ping with a fixed count, optionally a payload of `size` bytes with Don't Fragment set."""
+    if platform == "win32":
+        return ["ping", "-n", str(count), "-w", "2000", *(["-f", "-l", str(size)] if size else []), ip]
+    mac = platform == "darwin"
+    df = (["-D"] if mac else ["-M", "do"]) + ["-s", str(size)] if size else []
+    return ["ping", "-n", "-c", str(count), *df, "-t" if mac else "-w", "6", ip]
+
+
+def ping_loss(text: str, count: int) -> float:
+    """Loss in % from ping output on any OS and language: only real echo replies carry TTL."""
+    replies = sum(1 for line in text.splitlines() if re.search(r"\bttl[=:]\s*\d+", line, re.IGNORECASE))
+    return max(0.0, 100.0 * (count - replies) / count)
+
+
 def ping(ip: str, size: int | None = None, count: int = 4) -> float:
-    cmd = ["ping", "-n", "-c", str(count)]
-    if size:
-        cmd += ["-D", "-s", str(size)] if MAC else ["-M", "do", "-s", str(size)]
-    cmd += ["-t" if MAC else "-w", "6", ip]
-    m = re.search(r"([\d.]+)% packet loss", run(cmd, 15))
-    return float(m.group(1)) if m else 100.0
+    return ping_loss(run(ping_cmd(ip, size, count), 20), count)
 
 
 def tcp_connect(ip: str, port: int, timeout: float = 5) -> tuple[float | None, str | None]:
@@ -133,15 +155,15 @@ def parse_traceroute(text: str) -> list[Hop]:
             continue
         fields = m.group(1).split()
         ips = [f for f in fields if is_ip(f)]
-        rtts = [float(x) for x in re.findall(r"([\d.]+) ms", m.group(1))]
+        # Windows prints "<1 ms" / "<1 мс"; loss is counted from stars, so an unknown unit only loses the RTT
+        rtts = [float(x) for x in re.findall(r"([\d.]+)\s*(?:ms|мс)", m.group(1))]
         stars = fields.count("*")
-        total = stars + len(rtts)
         hops.append(
             {
                 "ip": ips[0] if ips else None,
                 "host": None,
                 "asn": None,
-                "loss": 100 * stars / total if total else 100.0,
+                "loss": 100 * min(stars, TRACE_PROBES) / TRACE_PROBES if ips else 100.0,
                 "rtt": round(sum(rtts) / len(rtts), 1) if rtts else None,
             }
         )
@@ -156,21 +178,34 @@ def is_ip(s: str) -> bool:
         return False
 
 
-def local_trace(ip: str, max_hops: int) -> list[Hop]:
-    base = ["traceroute", "-n", "-q", "3", "-w", "1", "-m", str(max_hops)]
-    hops = parse_traceroute(run(base + ["-I", ip], 150))
+def trace_cmds(ip: str, max_hops: int, platform: str = sys.platform) -> list[list[str]]:
+    """Commands to try in order; tracert is ICMP and needs no admin rights."""
+    if platform == "win32":
+        return [["tracert", "-d", "-h", str(max_hops), "-w", "1000", ip]]
+    base = ["traceroute", "-n", "-q", str(TRACE_PROBES), "-w", "1", "-m", str(max_hops)]
     # ICMP traceroute needs root on Linux; fall back to UDP there
-    return hops or parse_traceroute(run(base + [ip], 150))
+    return [base + ["-I", ip], base + [ip]]
+
+
+def local_trace(ip: str, max_hops: int) -> list[Hop]:
+    for cmd in trace_cmds(ip, max_hops):
+        if hops := parse_traceroute(run(cmd, 150)):
+            return hops
+    return []
 
 
 def local_checks(ip: str, port: int | None, max_hops: int) -> tuple[dict, Path]:
+    path = {"source": LOCAL, "proto": "ICMP", "hops": []}
     with cf.ThreadPoolExecutor() as ex:
         trace = ex.submit(local_trace, ip, max_hops)
         r = {"ping_loss": ping(ip), "mtu_loss": ping(ip, size=1472)}
         if port:
             r["tcp_ms"], r["tcp_error"] = tcp_connect(ip, port)
-        hops = trace.result()
-    return r, {"source": "этот компьютер", "proto": "ICMP", "hops": hops}
+        try:
+            path["hops"] = trace.result()
+        except RuntimeError as e:  # no traceroute installed: keep ping and TCP results
+            path["error"] = str(e)
+    return r, path
 
 
 # ---------- remote probes (Globalping) ----------
@@ -431,12 +466,32 @@ def verdict(
     )
 
 
-def headline(paths: list[Path], target_asn: int | None, near: set[int], names: dict[int, str]) -> tuple[str, str]:
+def headline(
+    paths: list[Path],
+    target_asn: int | None,
+    near: set[int],
+    names: dict[int, str],
+    local: dict | None = None,
+    port: int | None = None,
+) -> tuple[str, str]:
     """One-sentence answer for the forward checks."""
     done = [p for p in paths if p["hops"]]
     ok = [p for p in done if p["diag"]["reached"]]
     if not paths:
         return "info", "Маршрут не проверялся: добавьте -f СТРАНА или уберите --no-local."
+    # no trace got through, yet the address answers locally; not when a remote TCP trace failed,
+    # then the port itself is blocked somewhere
+    if not ok and local and not any(p["proto"].startswith("TCP") for p in done):
+        if local["ping_loss"] < 100 and all(p["source"] == LOCAL for p in done):
+            return "ok", (
+                "Адрес доступен: отвечает на ping. Трассировка не дошла до конца: не хватило --max-hops "
+                "или узлы на пути не отвечают на трассировку."
+            )
+        if local["ping_loss"] == 100 and local.get("tcp_ms"):
+            return "ok", (
+                f"Адрес доступен: порт {port} отвечает ({local['tcp_ms']} мс). Ping и трассировка не доходят, "
+                "потому что ICMP режут на пути или у цели. На работу сервиса это не влияет."
+            )
     if not done:
         return "fail", "Ни одна проверка маршрута не выполнилась."
     if len(ok) == len(done):
@@ -500,10 +555,11 @@ def compare(paths: list[Path], names: dict[int, str]) -> list[str]:
     return out
 
 
-def global_findings(local: dict | None, bgp: dict | None, port: int | None) -> list[str]:
+def global_findings(local: dict | None, bgp: dict | None, port: int | None, traced: bool = True) -> list[str]:
+    """`traced`: some trace reached the target; otherwise the headline already explains filtered ping."""
     out = []
     if local:
-        if local["ping_loss"] == 100 and local.get("tcp_ms"):
+        if local["ping_loss"] == 100 and local.get("tcp_ms") and traced:
             out.append(f"Ping не проходит, а порт {port} отвечает: ping просто запрещён, сам сервис доступен.")
         if local["ping_loss"] < 100 and local["mtu_loss"] == 100:
             out.append(
@@ -739,6 +795,9 @@ def print_details(r: dict, names: dict[int, str]) -> None:
 
 
 def main() -> int:
+    # redirected output on Windows defaults to cp1251/cp1252, which cannot encode the report's ✔ ⚠ →
+    for stream in (sys.stdout, sys.stderr):
+        stream.reconfigure(encoding="utf-8")
     ap = argparse.ArgumentParser(description="Где и в какой сети обрывается маршрут до IP.")
     ap.add_argument("target", help="IPv4 или имя хоста")
     ap.add_argument("-p", "--port", type=int, help="TCP-порт для проверки, например 443")
@@ -856,7 +915,7 @@ def main() -> int:
         "port": a.port,
         "target_asn": target_asn,
         "country": target_cc,
-        "headline": headline(paths, target_asn, neighbours | {target_asn}, names),
+        "headline": headline(paths, target_asn, neighbours | {target_asn}, names, local, a.port),
         "bgp": bgp,
         "rdap": reg,
         "geoip": geo,
@@ -870,7 +929,9 @@ def main() -> int:
         "source_ip": source_ip,
         "source_asn": source_asn,
         "reverse": back,
-        "findings": global_findings(local, bgp, a.port) + meta_findings(geo, transit, names) + compare(paths, names),
+        "findings": global_findings(local, bgp, a.port, any(p["diag"]["reached"] for p in paths))
+        + meta_findings(geo, transit, names)
+        + compare(paths, names),
         "errors": errors,
         "details": a.details,
     }

@@ -43,5 +43,7 @@ jobs:
           uv run --frozen --python ${{ matrix.python }} routecheck.py 1.1.1.1 -p 443 --max-hops 4 > report.txt 2> err.txt || true
           cat report.txt err.txt
           grep -q "ИТОГ" report.txt
+          # port 443 answers even where ICMP is blocked, so the verdict must not be "unreachable"
+          grep -q "Адрес доступен" report.txt
           grep -q "С этого компьютера" report.txt
           ! grep -q "Traceback" err.txt

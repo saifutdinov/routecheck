@@ -465,12 +465,26 @@ def verdict(
     )
 
 
-def headline(paths: list[Path], target_asn: int | None, near: set[int], names: dict[int, str]) -> tuple[str, str]:
+def headline(
+    paths: list[Path],
+    target_asn: int | None,
+    near: set[int],
+    names: dict[int, str],
+    local: dict | None = None,
+    port: int | None = None,
+) -> tuple[str, str]:
     """One-sentence answer for the forward checks."""
     done = [p for p in paths if p["hops"]]
     ok = [p for p in done if p["diag"]["reached"]]
     if not paths:
         return "info", "Маршрут не проверялся: добавьте -f СТРАНА или уберите --no-local."
+    # no ICMP trace got through, yet the service port answers: ICMP is filtered, the address is fine;
+    # only when no remote TCP trace failed, otherwise the port itself is blocked somewhere
+    if not ok and local and local.get("tcp_ms") and not any(p["proto"].startswith("TCP") for p in done):
+        return "ok", (
+            f"Адрес доступен: порт {port} отвечает ({local['tcp_ms']} мс). Ping и трассировка не доходят, "
+            "потому что ICMP режут на пути или у цели. На работу сервиса это не влияет."
+        )
     if not done:
         return "fail", "Ни одна проверка маршрута не выполнилась."
     if len(ok) == len(done):
@@ -534,10 +548,11 @@ def compare(paths: list[Path], names: dict[int, str]) -> list[str]:
     return out
 
 
-def global_findings(local: dict | None, bgp: dict | None, port: int | None) -> list[str]:
+def global_findings(local: dict | None, bgp: dict | None, port: int | None, traced: bool = True) -> list[str]:
+    """`traced`: some trace reached the target; otherwise the headline already explains filtered ping."""
     out = []
     if local:
-        if local["ping_loss"] == 100 and local.get("tcp_ms"):
+        if local["ping_loss"] == 100 and local.get("tcp_ms") and traced:
             out.append(f"Ping не проходит, а порт {port} отвечает: ping просто запрещён, сам сервис доступен.")
         if local["ping_loss"] < 100 and local["mtu_loss"] == 100:
             out.append(
@@ -893,7 +908,7 @@ def main() -> int:
         "port": a.port,
         "target_asn": target_asn,
         "country": target_cc,
-        "headline": headline(paths, target_asn, neighbours | {target_asn}, names),
+        "headline": headline(paths, target_asn, neighbours | {target_asn}, names, local, a.port),
         "bgp": bgp,
         "rdap": reg,
         "geoip": geo,
@@ -907,7 +922,9 @@ def main() -> int:
         "source_ip": source_ip,
         "source_asn": source_asn,
         "reverse": back,
-        "findings": global_findings(local, bgp, a.port) + meta_findings(geo, transit, names) + compare(paths, names),
+        "findings": global_findings(local, bgp, a.port, any(p["diag"]["reached"] for p in paths))
+        + meta_findings(geo, transit, names)
+        + compare(paths, names),
         "errors": errors,
         "details": a.details,
     }

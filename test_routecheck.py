@@ -251,3 +251,14 @@ def test_trace_cmds_per_platform():
     assert trace_cmds("1.1.1.1", 5, "win32") == [["tracert", "-d", "-h", "5", "-w", "1000", "1.1.1.1"]]
     unix = trace_cmds("1.1.1.1", 5, "linux")
     assert unix[0][0] == "traceroute" and "-I" in unix[0] and "-I" not in unix[1]
+
+
+def test_headline_icmp_filtered_but_port_answers():
+    silent = path("этот компьютер", [SILENT, SILENT])
+    local = {"ping_loss": 100.0, "mtu_loss": 100.0, "tcp_ms": 1.9}
+    status, text = headline([silent], 13335, {13335}, {}, local, 443)
+    assert status == "ok" and text.startswith("Адрес доступен: порт 443 отвечает (1.9 мс)")
+    # a failed remote TCP trace means the port itself is blocked somewhere: no all-clear
+    tcp = path("RU", [hop("7.7.7.7", 7), SILENT]) | {"proto": "TCP 443"}
+    assert headline([silent, tcp], 13335, {13335}, {}, local, 443)[0] == "fail"
+    assert headline([silent], 13335, {13335}, {}, local | {"tcp_ms": None}, 443)[0] == "fail"
